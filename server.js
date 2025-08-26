@@ -78,6 +78,7 @@ function detectPlatform(url) {
 }
 
 // Response normalization to ensure consistency
+// Enhanced response normalization
 function normalize(platform, raw) {
   const data = raw?.data && (raw.title || raw.formats || raw.platform) ? raw : raw?.data ? raw.data : raw;
 
@@ -88,6 +89,8 @@ function normalize(platform, raw) {
   const src = platform || data?.source || 'unknown';
 
   let formats = data?.formats || [];
+
+  // If no formats but we have a direct URL, create format entries
   if ((!formats || !formats.length) && directUrl) {
     formats = [{
       itag: 'best',
@@ -95,9 +98,27 @@ function normalize(platform, raw) {
       url: directUrl,
       mimeType: mediaType === 'audio' ? 'audio/mpeg' : 'video/mp4',
       hasAudio: mediaType !== 'video-only',
-      hasVideo: mediaType !== 'audio',
+      hasVideo: mediaType !== 'audio-only',
+      isVideo: mediaType !== 'audio-only',
+      contentLength: 0,
     }];
   }
+
+  // Ensure all formats have required fields for Flutter client
+  formats = formats.map((f, index) => ({
+    itag: f.itag || String(index),
+    quality: f.quality || 'Unknown',
+    url: f.url,
+    mimeType: f.mimeType || (f.hasVideo ? 'video/mp4' : 'audio/mp3'),
+    hasAudio: f.hasAudio !== false,
+    hasVideo: f.hasVideo === true,
+    isVideo: f.hasVideo === true || f.isVideo === true,
+    audioBitrate: f.audioBitrate || (f.hasAudio ? 128 : 0),
+    videoCodec: f.videoCodec || 'unknown',
+    audioCodec: f.audioCodec || 'unknown',
+    container: f.container || (f.hasVideo ? 'mp4' : 'mp3'),
+    contentLength: f.contentLength || 0,
+  }));
 
   return {
     success: true,
@@ -110,21 +131,41 @@ function normalize(platform, raw) {
     directUrl: directUrl ? `/api/direct?url=${encodeURIComponent(directUrl)}` : null,
   };
 }
-
 // Validate if formats are playable
+// Fixed format validation function
 function validateFormats(formats) {
   if (!Array.isArray(formats)) return [];
 
   return formats.filter(f => {
-    const u = f?.url;
-    if (!u) return false;
+    const url = f?.url;
+    if (!url) return false;
 
-    // Check for common playable formats
-    const isPlayable = /\.(mp4|m4v|mov|webm|m3u8|mpd|mp3|m4a|aac|ogg|wav|jpg|jpeg|png|gif)(\?|#|$)/i.test(u);
-    return isPlayable;
+    // More permissive validation - check for valid URLs
+    try {
+      new URL(url);
+
+      // Skip obvious non-media URLs
+      const lowerUrl = url.toLowerCase();
+      const badPatterns = [
+        '/ads/', '/ad/', '/tracker/', '/analytics/',
+        '/pixel/', '/beacon/', '.js', '.css', '.html'
+      ];
+
+      if (badPatterns.some(pattern => lowerUrl.includes(pattern))) {
+        return false;
+      }
+
+      // Accept if it has media indicators OR is from known media domains
+      const hasMediaExtension = /\.(mp4|m4v|mov|webm|m3u8|mpd|mp3|m4a|aac|ogg|wav|jpg|jpeg|png|gif)(\?|#|$)/i.test(url);
+      const isFromMediaDomain = /\b(twimg|fbcdn|cdninstagram|tiktok|youtube|googlevideo|pinimg|threads)\./i.test(url);
+      const hasMediaParam = /[?&](video|audio|media|download)=/i.test(url);
+
+      return hasMediaExtension || isFromMediaDomain || hasMediaParam;
+    } catch (e) {
+      return false;
+    }
   });
 }
-
 // YouTube endpoint
 app.get('/api/youtube', async (req, res) => {
   const url = req.query.url;
@@ -492,7 +533,83 @@ app.use((err, _req, res, _next) => {
   console.error('UNCAUGHT', err);
   res.status(500).json({ error: 'Server error', errorDetail: String(err.message || err) });
 });
+// Add this endpoint to server.js after the existing endpoints
+app.get('/api/special-media', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'Missing url' });
 
+  const platform = detectPlatform(url);
+
+  try {
+    let raw;
+
+    if (platform === 'music') {
+      raw = await downloadMusic(url);
+    } else {
+      // Use generic youtube-dl-exec for other special platforms
+      const info = await youtubeDl(url, {
+        dumpSingleJson: true,
+        noWarnings: true,
+        noCheckCertificates: true,
+        extractFlat: false,
+      });
+
+      const formats = [];
+
+      if (info?.formats?.length) {
+        info.formats.forEach((f, index) => {
+          if (f.url) {
+            formats.push({
+              itag: String(index),
+              quality: f.format_note || f.quality || 'Unknown',
+              url: f.url,
+              mimeType: f.ext === 'mp3' || f.acodec !== 'none' && f.vcodec === 'none' ? 'audio/mp3' : 'video/mp4',
+              hasAudio: f.acodec !== 'none',
+              hasVideo: f.vcodec !== 'none',
+              isVideo: f.vcodec !== 'none',
+              audioBitrate: f.abr || 0,
+              videoCodec: f.vcodec || 'unknown',
+              audioCodec: f.acodec || 'unknown',
+              container: f.ext || 'mp4',
+              contentLength: f.filesize || 0,
+            });
+          }
+        });
+      }
+
+      raw = {
+        success: true,
+        data: {
+          title: info.title || 'Media',
+          thumbnail: info.thumbnail || '',
+          duration: info.duration || null,
+          source: platform,
+          mediaType: info.duration ? 'video' : 'audio',
+          formats,
+        }
+      };
+    }
+
+    const uni = normalize(platform, raw);
+    uni.formats = validateFormats(uni.formats);
+
+    if (!uni.formats.length) {
+      return res.status(422).json({
+        error: 'No playable media found',
+        errorDetail: 'The URL was processed but produced no playable streams.',
+        platform,
+      });
+    }
+
+    res.json(uni);
+  } catch (e) {
+    res.status(500).json({
+      error: 'Special media processing failed',
+      errorDetail: String(e.message || e),
+      platform
+    });
+  }
+});
 app.listen(port, () => {
   console.log(`✅ UniSaver backend listening on http://localhost:${port}`);
   console.log('Supported platforms: YouTube, Facebook, Instagram, TikTok, Twitter, Threads, Pinterest, Vimeo, Music');
