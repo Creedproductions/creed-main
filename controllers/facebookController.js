@@ -1,139 +1,79 @@
 // controllers/facebookController.js
-// Uses "btch-downloader" for Facebook video downloads and returns only playable MP4 links.
-const { fbdown } = require("btch-downloader");
-const { shortenUrl } = require("../utils/urlShortener");
+// Strategy: use yt-dlp with proper Referer + UA, choose progressive MP4 with audio.
+// Return direct CDN URLs; server will proxy via /api/direct for playability.
+
+const ytdlp = require('youtube-dl-exec');
+
+function extFromFormat(f) {
+  if (f.ext) return f.ext;
+  if (f.container) return f.container;
+  if (f.mimeType) {
+    if (f.mimeType.includes('video/')) return 'mp4';
+    if (f.mimeType.includes('audio/')) return 'mp3';
+  }
+  if (f.mime_type) {
+    if (f.mime_type.includes('video/')) return 'mp4';
+    if (f.mime_type.includes('audio/')) return 'mp3';
+  }
+  return 'mp4';
+}
 
 async function downloadFacebookVideo(url) {
   try {
-    const result = await fbdown(url);
+    const info = await ytdlp(url, {
+      dumpSingleJson: true,
+      noWarnings: true,
+      noCheckCertificates: true,
+      referer: 'https://www.facebook.com/',
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
+    });
 
-    if (!result || !result.result || !Array.isArray(result.result) || result.result.length === 0) {
-      throw new Error("No downloadable links found for this Facebook video");
+    const all = Array.isArray(info?.formats) ? info.formats : [];
+
+    // Prefer progressive MP4 with audio
+    let pick = all.filter(
+      (f) => (f.ext === 'mp4' || f.ext === 'm4v') && f.vcodec !== 'none' && f.acodec !== 'none' && f.url
+    );
+    if (!pick.length) {
+      // Next best: any mp4 with video
+      pick = all.filter((f) => (f.ext === 'mp4' || f.ext === 'm4v') && f.vcodec !== 'none' && f.url);
     }
+    if (!pick.length) pick = all.filter((f) => f.url);
 
-    // Extract title and clean HTML entities
-    const titleRaw = result.title || result.result[0]?.title || "Facebook Video";
-    const title = titleRaw
-      .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-      .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(dec))
-      .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')
-      .trim() || "Facebook Video";
+    const formats = pick.map((f, i) => ({
+      itag: String(f.format_id || i),
+      quality: f.format_note || (f.height ? `${f.height}p` : 'Original Quality'),
+      url: f.url, // direct; server will proxy with FB referer
+      mimeType: f.mime_type || (f.vcodec && f.vcodec !== 'none' ? `video/${extFromFormat(f)}` : `audio/${extFromFormat(f)}`),
+      hasAudio: f.acodec && f.acodec !== 'none',
+      hasVideo: f.vcodec && f.vcodec !== 'none',
+      container: extFromFormat(f),
+      contentLength: Number(f.filesize || f.filesize_approx || 0),
+      audioBitrate: f.abr || 0,
+      videoCodec: f.vcodec || 'unknown',
+      audioCodec: f.acodec || 'unknown',
+    }));
 
-    // Get best quality link (usually first in array)
-    const best = result.result[0];
-    const bestShort = await shortenUrl(best.url);
-
-    // Build formats array
-    const formats = [];
-    for (let i = 0; i < result.result.length; i++) {
-      const link = result.result[i];
-      const sUrl = await shortenUrl(link.url);
-      formats.push({
-        itag: String(i),
-        quality: link.quality || link.resolution || "Unknown",
-        url: sUrl,
-        mimeType: "video/mp4",
-        hasAudio: true,
-        hasVideo: true,
-        contentLength: 0,
-      });
-    }
+    const best = formats[0];
+    if (!best) throw new Error('No playable Facebook formats found');
 
     return {
       success: true,
       data: {
-        title,
-        url: bestShort,
-        thumbnail: result.thumbnail || best.thumbnail || "https://via.placeholder.com/300x150",
-        quality: best.quality || best.resolution || "Best Available",
-        duration: result.duration || null,
-        source: "facebook",
+        title: info?.title || 'Facebook Video',
+        url: best.url,
+        thumbnail: info?.thumbnail || 'https://via.placeholder.com/300x150',
+        quality: best.quality,
+        duration: info?.duration || null,
+        source: 'facebook',
+        mediaType: best.hasVideo ? 'video' : 'audio',
         formats,
       },
     };
-  } catch (error) {
-    console.error("Facebook download error:", error);
-    throw new Error(`Failed to download Facebook video: ${error.message}`);
+  } catch (err) {
+    throw new Error(`Facebook download failed: ${err.message}`);
   }
 }
 
-// Alternative implementation using herxa-media-downloader as fallback
-async function downloadFacebookVideoAlternative(url) {
-  try {
-    const { ndown } = require("herxa-media-downloader");
-    const result = await ndown(url);
-
-    if (!result || !result.status || !Array.isArray(result.data) || result.data.length === 0) {
-      throw new Error("No downloadable links found for this Facebook video");
-    }
-
-    const titleRaw = result.title || "Facebook Video";
-    const title = titleRaw
-      .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-      .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(dec))
-      .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')
-      .trim() || "Facebook Video";
-
-    const best = result.data[0];
-    const bestShort = await shortenUrl(best.url);
-
-    const formats = [];
-    for (let i = 0; i < result.data.length; i++) {
-      const link = result.data[i];
-      const sUrl = await shortenUrl(link.url);
-      formats.push({
-        itag: String(i),
-        quality: link.resolution || "Unknown",
-        url: sUrl,
-        mimeType: "video/mp4",
-        hasAudio: true,
-        hasVideo: true,
-        contentLength: 0,
-      });
-    }
-
-    return {
-      success: true,
-      data: {
-        title,
-        url: bestShort,
-        thumbnail: result.thumbnail || best.thumbnail || "https://via.placeholder.com/300x150",
-        quality: best.resolution || "Best Available",
-        duration: result.duration || null,
-        source: "facebook",
-        formats,
-      },
-    };
-  } catch (error) {
-    console.error("Facebook alternative download error:", error);
-    throw new Error(`Failed to download Facebook video with alternative method: ${error.message}`);
-  }
-}
-
-// Main function with fallback logic
-async function downloadFacebookVideoWithFallback(url) {
-  try {
-    // Try primary method first
-    return await downloadFacebookVideo(url);
-  } catch (primaryError) {
-    console.log("Primary method failed, trying alternative...");
-    try {
-      // Try alternative method
-      return await downloadFacebookVideoAlternative(url);
-    } catch (alternativeError) {
-      console.error("Both methods failed:", {
-        primary: primaryError.message,
-        alternative: alternativeError.message
-      });
-      throw new Error("All Facebook download methods failed");
-    }
-  }
-}
-
-module.exports = {
-  downloadFacebookVideo: downloadFacebookVideoWithFallback,
-  downloadFacebookVideoPrimary: downloadFacebookVideo,
-  downloadFacebookVideoAlternative: downloadFacebookVideoAlternative
-};
+module.exports = { downloadFacebookVideo };
