@@ -1,180 +1,239 @@
 // controllers/instagramController.js
-// Order:
-// 1) btch-downloader igdl() (fast, direct)
-// 2) Lightweight HTML (og:video/og:image)
-// 3) yt-dlp fallback with Instagram referer
-//
-// Returns { success: true, data: { title, url, thumbnail, mediaType, formats } }
+// Tries lightweight extractors first; supports cookies for private/limited content.
+// Always returns proxied, playable URLs in formats[].url
 
-const ytdlp = require('youtube-dl-exec');
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const youtubeDl = require('youtube-dl-exec'); // wraps yt-dlp if present
+const { igdl } = require('btch-downloader');
 
-let igdl = null;
-try { ({ igdl } = require('btch-downloader')); } catch { igdl = null; }
-
-let fetchFn = (typeof fetch !== 'undefined') ? fetch : null;
-if (!fetchFn) { try { fetchFn = require('node-fetch'); } catch {} }
-if (!fetchFn) { throw new Error("Fetch API not available. Use Node 18+ or install 'node-fetch'."); }
-
-function cleanUrl(u = '') {
-  return String(u).replace(/\\u002F/g,'/').replace(/\\\//g,'/').replace(/\\/g,'').replace(/&amp;/g,'&').trim();
-}
-function extFrom(url) {
-  const m = String(url).toLowerCase().match(/\.(mp4|m4v|webm|mp3|m4a|aac|jpg|jpeg|png|gif|webp)(?:$|\?)/);
-  return m ? m[1].replace('jpeg','jpg') : (url.includes('.mp4') ? 'mp4' : 'jpg');
-}
-function asFormat(u, i, label='Original') {
-  const ext = extFrom(u);
-  const isVideo = /(mp4|m4v|webm)$/i.test(ext);
-  const isImage = /(jpg|png|gif|webp)$/i.test(ext);
-  return {
-    itag: String(i),
-    quality: label,
-    url: u,
-    mimeType: isVideo ? `video/${ext}` : (isImage ? `image/${ext}` : `audio/${ext}`),
-    hasAudio: isVideo,
-    hasVideo: isVideo,
-    container: ext,
-    contentLength: 0
-  };
-}
-function ok(title, thumb, formats) {
-  const best = formats.find(f => f.hasVideo) || formats[0];
-  return {
-    success: true,
-    data: {
-      title: title || 'Instagram Media',
-      url: best?.url || formats[0]?.url,
-      thumbnail: thumb || (formats.find(f => f.mimeType.startsWith('image/'))?.url || ''),
-      duration: null,
-      source: 'instagram',
-      mediaType: best?.hasVideo ? 'video' : (best?.mimeType?.startsWith('image/') ? 'image' : 'audio'),
-      formats,
-    }
-  };
+function makeProxy(mediaUrl, title = 'Instagram', ext = 'mp4') {
+  const safe = String(title || 'Instagram').replace(/[^\w\-]+/g, '_').slice(0, 60);
+  return `/api/direct?url=${encodeURIComponent(mediaUrl)}&referer=instagram.com&filename=${encodeURIComponent(safe)}.${ext}`;
 }
 
+function getCookieString() {
+  // Preferred: one-liner cookie string (e.g. "sessionid=...; ds_user_id=...; csrftoken=...")
+  if (process.env.IG_COOKIE_STRING && process.env.IG_COOKIE_STRING.trim()) {
+    return process.env.IG_COOKIE_STRING.trim();
+  }
+  return null;
+}
+
+function ensureCookieFile() {
+  // Alternative: full Netscape cookie file path via IG_COOKIES_FILE
+  const file = process.env.IG_COOKIES_FILE;
+  if (file && fs.existsSync(file)) return file;
+
+  // Or write a minimal cookie file from IG_COOKIE_STRING (best effort)
+  const cookieStr = getCookieString();
+  if (!cookieStr) return null;
+
+  const tmp = path.join('/tmp', `ig_cookies_${Date.now()}.txt`);
+  const lines = [
+    '# Netscape HTTP Cookie File',
+    '# This file was generated from IG_COOKIE_STRING',
+  ];
+  // Convert "a=b; c=d" into lines: .instagram.com TRUE / FALSE 0 a b
+  cookieStr.split(';').map(s => s.trim()).forEach(pair => {
+    const [k, ...rest] = pair.split('=');
+    if (!k || !rest.length) return;
+    const v = rest.join('=');
+    lines.push(`.instagram.com\tTRUE\t/\tFALSE\t0\t${k}\t${v}`);
+  });
+  fs.writeFileSync(tmp, lines.join('\n'));
+  return tmp;
+}
+
+function normalizeFormats(title, urls) {
+  // Map a list of direct media URLs into your app’s expected shape (all proxied)
+  const unique = Array.from(new Set(urls.filter(Boolean)));
+  const formats = unique.map((u, i) => {
+    const isImage = /\.(jpe?g|png|webp)(\?|#|$)/i.test(u);
+    const ext = isImage ? (u.toLowerCase().includes('.png') ? 'png' : 'jpg') : 'mp4';
+    return {
+      itag: String(i),
+      quality: isImage ? 'Original Image' : 'Original Quality',
+      url: makeProxy(u, title, ext),
+      mimeType: isImage ? `image/${ext === 'jpg' ? 'jpeg' : ext}` : 'video/mp4',
+      hasAudio: !isImage,
+      hasVideo: !isImage,
+      isVideo: !isImage,
+      container: ext,
+      contentLength: 0,
+    };
+  });
+  return formats;
+}
+
+// Try simple extractor first
 async function tryIgdl(url) {
-  if (!igdl) throw new Error('igdl not available');
-  const res = await igdl(url);
-  // Common shapes: array of {url, thumbnail, wm?}
-  const items = Array.isArray(res) ? res : (Array.isArray(res?.data) ? res.data : []);
-  const urls = items.map(x => x?.url).filter(Boolean);
-  if (!urls.length) throw new Error('igdl returned no urls');
-
-  const formats = urls.map((u, i) => asFormat(u, i, i === 0 ? 'Best' : 'Alt'));
-  const title = items[0]?.wm || 'Instagram Media';
-  const thumb = items[0]?.thumbnail || '';
-  return ok(title, thumb, formats);
-}
-
-async function tryHtml(url) {
-  const resp = await fetchFn(url, {
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Referer': 'https://www.instagram.com/',
-      'Cache-Control': 'no-cache',
-    },
-    redirect: 'follow',
-  });
-  if (!resp.ok) throw new Error(`page fetch ${resp.status}`);
-  const html = await resp.text();
-
-  let title = 'Instagram Media';
-  const t = html.match(/<title>([^<]+)<\/title>/i);
-  if (t?.[1]) title = t[1].replace(' • Instagram photos and videos','').trim();
-
-  let thumb = '';
-  const ogImg = html.match(/<meta property="og:image" content="([^"]+)"/i);
-  if (ogImg?.[1]) thumb = cleanUrl(ogImg[1]);
-
-  const candidates = new Set();
-  const patterns = [
-    /<meta property="og:video" content="([^"]+)"/i,
-    /<meta property="og:video:url" content="([^"]+)"/i,
-    /"video_url":"([^"]+)"/i,
-    /https?:\/\/[^\s"']+\.mp4[^\s"']*/i
-  ];
-  for (const p of patterns) {
-    const m = html.match(p);
-    if (m?.[1]) candidates.add(cleanUrl(m[1]));
-  }
-
-  if (candidates.size) {
-    const list = Array.from(candidates);
-    const formats = list.map((u,i) => asFormat(u,i, i===0?'Best':'Alt'));
-    return ok(title, thumb, formats);
-  }
-
-  // Image fallback
-  const images = new Set();
-  const ip = [
-    /"display_url":"([^"]+)"/ig,
-    /"image_url":"([^"]+)"/ig,
-    /https:\/\/scontent[^"']+\.(?:jpg|jpeg|png|webp)[^"']*/ig
-  ];
-  for (const p of ip) {
-    let m;
-    while ((m = p.exec(html)) !== null) images.add(cleanUrl(m[1] || m[0]));
-  }
-  if (!images.size && ogImg?.[1]) images.add(cleanUrl(ogImg[1]));
-
-  if (images.size) {
-    const list = Array.from(images);
-    const formats = list.map((u,i) => asFormat(u,i, i===0?'Original':'Alt'));
-    return ok(title, list[0], formats);
-  }
-
-  throw new Error('no media found in HTML');
-}
-
-async function tryYtdlp(url) {
-  const info = await ytdlp(url, {
-    dumpSingleJson: true,
-    noWarnings: true,
-    noCheckCertificates: true,
-    referer: 'https://www.instagram.com/',
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
-  });
-
-  const all = Array.isArray(info?.formats) ? info.formats : [];
-  const pick = all.filter(f => f?.url);
-  if (!pick.length && info?.url) pick.push({ url: info.url, ext: 'mp4', vcodec: 'unknown', acodec: 'unknown' });
-  if (!pick.length) throw new Error('yt-dlp returned no formats');
-
-  const formats = pick.map((f, i) => ({
-    itag: String(f.format_id || i),
-    quality: f.format_note || (f.height ? `${f.height}p` : 'Original'),
-    url: f.url,
-    mimeType: f.mime_type || (f.vcodec && f.vcodec !== 'none' ? `video/${f.ext || 'mp4'}` : `audio/${f.ext || 'mp3'}`),
-    hasAudio: f.acodec && f.acodec !== 'none',
-    hasVideo: f.vcodec && f.vcodec !== 'none',
-    container: f.ext || 'mp4',
-    contentLength: Number(f.filesize || f.filesize_approx || 0),
-  }));
-
-  const best = formats[0];
-  return {
-    success: true,
-    data: {
-      title: info?.title || 'Instagram Media',
-      url: best.url,
-      thumbnail: info?.thumbnail || '',
-      duration: info?.duration || null,
-      source: 'instagram',
-      mediaType: best.hasVideo ? 'video' : 'audio',
-      formats,
+  try {
+    const data = await igdl(url);
+    if (Array.isArray(data) && data.length) {
+      const first = data[0];
+      const title = (first?.title || first?.wm || 'Instagram').toString();
+      const urls = data.map(d => d?.url).filter(Boolean);
+      const thumb = first?.thumbnail || first?.thumb || '';
+      return {
+        title,
+        thumbnail: thumb,
+        urls
+      };
     }
-  };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Fallback: HTML scrape (works for many public posts without login)
+async function tryHtml(url) {
+  try {
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Referer': 'https://www.instagram.com/',
+    };
+    const cookie = getCookieString();
+    if (cookie) headers['Cookie'] = cookie;
+
+    const res = await axios.get(url, { headers, timeout: 20000 });
+    const html = res.data || '';
+
+    const urls = [];
+    // Common meta tags
+    const ogVid = html.match(/<meta\s+property="og:video"\s+content="([^"]+)"/i);
+    if (ogVid && ogVid[1]) urls.push(ogVid[1].replace(/&amp;/g, '&'));
+
+    const ogImg = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i);
+    if (ogImg && ogImg[1]) urls.push(ogImg[1].replace(/&amp;/g, '&'));
+
+    // JSON blobs sometimes include "video_url" or "display_url"
+    const jMatches = html.match(/"video_url":"([^"]+)"/g) || [];
+    jMatches.forEach(m => {
+      const u = m.split('"video_url":"')[1].replace(/\\u0026/g, '&').replace(/\\"/g, '"').replace(/\\\//g, '/');
+      urls.push(u);
+    });
+    const iMatches = html.match(/"display_url":"([^"]+)"/g) || [];
+    iMatches.forEach(m => {
+      const u = m.split('"display_url":"')[1].replace(/\\u0026/g, '&').replace(/\\"/g, '"').replace(/\\\//g, '/');
+      urls.push(u);
+    });
+
+    // Title
+    let title = 'Instagram';
+    const t1 = html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i);
+    if (t1 && t1[1]) title = t1[1];
+
+    const thumb = ogImg ? ogImg[1] : '';
+
+    const uniq = Array.from(new Set(urls.filter(Boolean)));
+    if (!uniq.length) return null;
+
+    return { title, thumbnail: thumb, urls: uniq };
+  } catch {
+    return null;
+  }
+}
+
+// Final fallback: yt-dlp with cookies when required
+async function tryYtdlp(url) {
+  const cookieFile = ensureCookieFile();
+  try {
+    const info = await youtubeDl(url, {
+      dumpSingleJson: true,
+      noWarnings: true,
+      noCheckCertificates: true,
+      referer: 'https://www.instagram.com/',
+      "user-agent": 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      cookies: cookieFile || undefined, // --cookies <file>
+      timeout: 30000,
+    });
+
+    const urls = [];
+    if (info?.url) urls.push(info.url);
+    if (Array.isArray(info?.formats)) {
+      info.formats.forEach(f => { if (f?.url) urls.push(f.url); });
+    }
+    const title = info?.title || 'Instagram';
+    const thumb = info?.thumbnail || '';
+
+    const uniq = Array.from(new Set(urls.filter(Boolean)));
+    if (!uniq.length) return null;
+
+    return { title, thumbnail: thumb, urls: uniq };
+  } catch (e) {
+    // surface the typical login hint for clarity
+    throw new Error(
+      "Instagram download failed: " +
+      (e?.message || e) +
+      (cookieFile ? "" : " | Hint: set IG_COOKIE_STRING or IG_COOKIES_FILE in env for private/limited posts.")
+    );
+  } finally {
+    if (cookieFile && cookieFile.startsWith('/tmp/ig_cookies_') && fs.existsSync(cookieFile)) {
+      fs.unlink(cookieFile, () => {});
+    }
+  }
 }
 
 async function downloadInstagramMedia(url) {
-  try { return await tryIgdl(url); } catch (_) {}
-  try { return await tryHtml(url); } catch (_) {}
-  return await tryYtdlp(url);
+  // 1) fast extractor
+  const quick = await tryIgdl(url);
+  if (quick?.urls?.length) {
+    const formats = normalizeFormats(quick.title, quick.urls);
+    return {
+      success: true,
+      data: {
+        title: quick.title,
+        url: formats[0].url,
+        thumbnail: quick.thumbnail || '',
+        quality: formats[0].quality,
+        source: 'instagram',
+        mediaType: /\.(jpe?g|png|webp)(\?|#|$)/i.test(quick.urls[0]) ? 'image' : 'video',
+        formats,
+      }
+    };
+  }
+
+  // 2) html (public)
+  const html = await tryHtml(url);
+  if (html?.urls?.length) {
+    const formats = normalizeFormats(html.title, html.urls);
+    return {
+      success: true,
+      data: {
+        title: html.title,
+        url: formats[0].url,
+        thumbnail: html.thumbnail || '',
+        quality: formats[0].quality,
+        source: 'instagram',
+        mediaType: /\.(jpe?g|png|webp)(\?|#|$)/i.test(html.urls[0]) ? 'image' : 'video',
+        formats,
+      }
+    };
+  }
+
+  // 3) yt-dlp (with cookies if provided)
+  const ytdlp = await tryYtdlp(url);
+  if (ytdlp?.urls?.length) {
+    const formats = normalizeFormats(ytdlp.title, ytdlp.urls);
+    return {
+      success: true,
+      data: {
+        title: ytdlp.title,
+        url: formats[0].url,
+        thumbnail: ytdlp.thumbnail || '',
+        quality: formats[0].quality,
+        source: 'instagram',
+        mediaType: /\.(jpe?g|png|webp)(\?|#|$)/i.test(ytdlp.urls[0]) ? 'image' : 'video',
+        formats,
+      }
+    };
+  }
+
+  throw new Error("Instagram download failed: No playable media found");
 }
 
 module.exports = { downloadInstagramMedia };

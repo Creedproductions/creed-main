@@ -1,175 +1,120 @@
 // controllers/youtubeController.js
-// Robust YouTube controller:
-// 1) primary: Vidfly API (fast, many formats)
-// 2) fallback: yt-dlp (progressive MP4 with audio preferred)
+// Robust: always return playable, proxied URLs for your Flutter app.
 
-const axios = require('axios');
-const ytdlp = require('youtube-dl-exec');
+const axios = require("axios");
+
+/** Build a proxied URL so downloads stream through /api/direct with proper headers */
+function makeProxy(mediaUrl, title = 'YouTube Video', ext = 'mp4') {
+  const safe = String(title || 'YouTube_Video').replace(/[^\w\-]+/g, '_').slice(0, 60);
+  return `/api/direct?url=${encodeURIComponent(mediaUrl)}&referer=youtube.com&filename=${encodeURIComponent(safe)}.${ext}`;
+}
 
 function qualityToNumber(q) {
   const n = parseInt(String(q || '').replace(/[^\d]/g, ''), 10);
   return Number.isFinite(n) ? n : 0;
 }
 
-function extFromFormat(f) {
-  if (f.ext) return f.ext;
-  if (f.extension) return f.extension;
-  if (f.container) return f.container;
-  if (f.mimeType) {
-    if (f.mimeType.includes('video/')) return 'mp4';
-    if (f.mimeType.includes('audio/')) return 'mp3';
-  }
-  if (f.mime_type) {
-    if (f.mime_type.includes('video/')) return 'mp4';
-    if (f.mime_type.includes('audio/')) return 'mp3';
-  }
-  return 'mp4';
+/** Prefer direct MP4-ish URLs when available */
+function looksPlayableMp4(u = "") {
+  const s = u.toLowerCase();
+  return s.includes(".mp4") || s.includes("mime=video/mp4") || s.includes("itag=");
 }
 
 async function fetchYouTubeData(url) {
-  try {
-    const res = await axios.get('https://api.vidfly.ai/api/media/youtube/download', {
-      params: { url },
-      headers: {
-        accept: '*/*',
-        'content-type': 'application/json',
-        'x-app-name': 'vidfly-web',
-        'x-app-version': '1.0.0',
-        Referer: 'https://vidfly.ai/',
-      },
-      timeout: 25000,
-    });
-
-    const data = res.data?.data;
-    if (!data || !Array.isArray(data.items) || !data.title) {
-      throw new Error('Invalid or empty response from YouTube downloader API');
-    }
-
-    return {
-      title: data.title,
-      thumbnail: data.cover,
-      duration: data.duration,
-      formats: data.items
-        .filter((it) => it?.url)
-        .map((it) => ({
-          type: it.type, // 'video' | 'audio' | 'video-only' | 'audio-only'
-          quality: it.label || it.quality || 'unknown',
-          ext: it.ext || it.extension || 'mp4',
-          url: it.url,
-        })),
-    };
-  } catch (err) {
-    throw new Error(`YouTube downloader request failed: ${err.message}`);
-  }
-}
-
-function pickBestFromVidfly(data) {
-  const withUrl = data.formats.filter((f) => !!f.url);
-  // Prefer highest quality "video" (has audio)
-  const videoWithAudio = withUrl.filter((f) => f.type === 'video');
-  const best =
-    videoWithAudio.sort((a, b) => qualityToNumber(b.quality) - qualityToNumber(a.quality))[0] ||
-    withUrl[0] ||
-    null;
-  return best;
-}
-
-async function fallbackWithYtdlp(url) {
-  const info = await ytdlp(url, {
-    dumpSingleJson: true,
-    noWarnings: true,
-    noCheckCertificates: true,
-    referer: 'https://www.youtube.com/',
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
+  // Using vidfly because it tends to return ready-to-stream muxed links
+  const res = await axios.get("https://api.vidfly.ai/api/media/youtube/download", {
+    params: { url },
+    headers: {
+      accept: "*/*",
+      "content-type": "application/json",
+      "x-app-name": "vidfly-web",
+      "x-app-version": "1.0.0",
+      Referer: "https://vidfly.ai/",
+    },
+    timeout: 30000,
   });
 
-  const all = Array.isArray(info?.formats) ? info.formats : [];
-  // Prefer progressive mp4 with audio+video
-  let pick = all.filter(
-    (f) => (f.ext === 'mp4' || f.ext === 'm4v') && f.vcodec !== 'none' && f.acodec !== 'none' && f.url
-  );
-  if (!pick.length) {
-    // next best: mp4 with video
-    pick = all.filter((f) => (f.ext === 'mp4' || f.ext === 'm4v') && f.vcodec !== 'none' && f.url);
+  const data = res.data?.data;
+  if (!data || !data.items || !data.title) {
+    throw new Error("Invalid or empty response from YouTube downloader API");
   }
-  if (!pick.length) pick = all.filter((f) => f.url);
 
-  const formats = pick.map((f, i) => ({
-    itag: String(f.format_id || i),
-    quality: f.format_note || (f.height ? `${f.height}p` : 'Best'),
-    url: f.url,
-    mimeType: f.mime_type || (f.vcodec && f.vcodec !== 'none' ? `video/${extFromFormat(f)}` : `audio/${extFromFormat(f)}`),
-    hasAudio: f.acodec && f.acodec !== 'none',
-    hasVideo: f.vcodec && f.vcodec !== 'none',
-    contentLength: Number(f.filesize || f.filesize_approx || 0),
-    container: extFromFormat(f),
-    audioBitrate: f.abr || 0,
-    videoCodec: f.vcodec || 'unknown',
-    audioCodec: f.acodec || 'unknown',
-  }));
-
-  const best = formats[0];
-  if (!best) throw new Error('yt-dlp fallback found no usable formats');
-
+  // Normalize (keep original URL in memory; we proxy later)
   return {
-    success: true,
-    data: {
-      title: info?.title || 'YouTube Video',
-      url: best.url,
-      thumbnail: info?.thumbnail || 'https://via.placeholder.com/300x150',
-      quality: best.quality || 'Best',
-      duration: info?.duration || null,
-      source: 'youtube',
-      mediaType: best.hasVideo ? 'video' : 'audio',
-      formats,
-    },
+    title: data.title,
+    thumbnail: data.cover,
+    duration: data.duration,
+    formats: data.items.map((item) => ({
+      type: item.type, // 'video' | 'audio' | 'video-only' | 'audio-only'
+      quality: item.label || item.quality || "unknown",
+      ext: item.ext || item.extension || "mp4",
+      url: item.url,
+    })),
   };
 }
 
 async function downloadYouTubeVideo(url) {
   try {
     const data = await fetchYouTubeData(url);
-    const best = pickBestFromVidfly(data);
-    if (!best) throw new Error('No valid download URL found');
 
-    const formats = data.formats.map((f, index) => {
-      const isAudioOnly = f.type === 'audio' || f.type === 'audio-only';
-      const isVideoOnly = f.type === 'video-only';
-      const ext = extFromFormat(f);
+    // pick the best *muxed video with audio* when possible
+    const muxed = data.formats.filter(f => f.url && f.type === 'video');
+    const bestMuxed =
+      muxed.sort((a, b) => qualityToNumber(b.quality) - qualityToNumber(a.quality))[0] ||
+      data.formats.find(f => f.url) ||
+      null;
 
-      return {
-        itag: String(index),
-        quality: f.quality || 'unknown',
-        url: f.url, // direct; server will proxy
-        mimeType: `${isAudioOnly ? 'audio' : 'video'}/${ext}`,
-        hasAudio: !isVideoOnly,
-        hasVideo: !isAudioOnly,
-        contentLength: 0,
-        container: ext,
-        isVideo: !isAudioOnly,
-        audioBitrate: isAudioOnly ? 128 : 0,
-        videoCodec: isAudioOnly ? 'none' : 'h264',
-        audioCodec: isVideoOnly ? 'none' : 'aac',
-      };
-    });
+    if (!bestMuxed) throw new Error("No valid download URL found");
+
+    // Build the list your client shows. IMPORTANT: we proxy every URL.
+    const appFormats = data.formats
+      .filter(f => f.url)
+      .map((f, index) => {
+        const isAudioOnly = f.type === 'audio' || f.type === 'audio-only';
+        const isVideoOnly = f.type === 'video-only';
+        const ext = f.ext || (isAudioOnly ? 'mp3' : 'mp4');
+
+        // Prefer playable mp4-ish for top entries
+        const proxied = makeProxy(f.url, data.title, ext);
+
+        return {
+          itag: String(index),
+          quality: f.quality || 'unknown',
+          url: proxied, // <-- your app will click this
+          mimeType: `${isAudioOnly ? 'audio' : 'video'}/${ext}`,
+          hasAudio: !isVideoOnly,
+          hasVideo: !isAudioOnly,
+          isVideo: !isAudioOnly,
+          audioBitrate: isAudioOnly ? 128 : 0,
+          videoCodec: isAudioOnly ? 'none' : 'h264',
+          audioCodec: isVideoOnly ? 'none' : 'aac',
+          container: ext || 'mp4',
+          contentLength: 0,
+        };
+      })
+      // put mp4-like first so the default selection is playable
+      .sort((a, b) => Number(looksPlayableMp4(b.url)) - Number(looksPlayableMp4(a.url)));
+
+    // "best" top-level url (also proxied)
+    const bestExt = bestMuxed.ext || 'mp4';
+    const bestUrl = makeProxy(bestMuxed.url, data.title, bestExt);
 
     return {
       success: true,
       data: {
         title: data.title,
-        url: best.url,
+        url: bestUrl,
         thumbnail: data.thumbnail || 'https://via.placeholder.com/300x150',
-        quality: best.quality || 'Best Available',
-        duration: data.duration || null,
+        quality: bestMuxed.quality || 'Best Available',
+        duration: data.duration,
         source: 'youtube',
         mediaType: 'video',
-        formats,
-      },
+        formats: appFormats,
+      }
     };
   } catch (err) {
-    // Fallback to yt-dlp if the primary fails
-    return await fallbackWithYtdlp(url);
+    console.error('YouTube controller failed:', err);
+    throw new Error(`YouTube download failed: ${err.message}`);
   }
 }
 
