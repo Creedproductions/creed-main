@@ -24,8 +24,6 @@
     "morgan": "^1.10.1",
     "node-fetch": "^2.7.0",
     "tinyurl": "^1.1.7",
-    "ironman-api": "^1.0.0",
-    "jer-api": "^1.0.0",
     "youtube-dl-exec": "^3.0.24"
   },
   "devDependencies": {
