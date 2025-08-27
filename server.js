@@ -245,65 +245,108 @@ function normalizeToUnified(platform, rawData) {
   };
 }
 
-// Generic yt-dlp extractor
+// Generic yt-dlp extractor with compatible options
 async function extractWithYtdlp(url, platform) {
   const platformConfig = getPlatformConfig(platform, url);
 
+  // Use only compatible options (remove --timeout and other problematic flags)
   const options = {
     dumpSingleJson: true,
     noWarnings: true,
     noCheckCertificates: true,
-    userAgent: platformConfig.userAgent,
-    timeout: 30
+    userAgent: platformConfig.userAgent
+    // Removed timeout option as it's not supported in some versions
   };
 
   if (platformConfig.referer) {
     options.referer = platformConfig.referer;
   }
 
-  const info = await ytdlp(url, options);
-  const title = titleFromInfo(info, `${platform} Media`);
+  try {
+    console.log(`Executing yt-dlp for ${platform} with compatible options`);
+    const info = await youtubeDl(url, options);
+    const title = titleFromInfo(info, `${platform} Media`);
 
-  // Process formats
-  const allFormats = Array.isArray(info?.formats) ? info.formats : [];
-  let chosenFormats = allFormats.filter(f => f.url);
+    // Process formats
+    const allFormats = Array.isArray(info?.formats) ? info.formats : [];
+    let chosenFormats = allFormats.filter(f => f.url);
 
-  // Prefer progressive formats for better compatibility
-  const progressive = allFormats.filter(f =>
-    (f.ext === 'mp4' || f.ext === 'm4v') &&
-    f.vcodec && f.vcodec !== 'none' &&
-    f.acodec && f.acodec !== 'none' &&
-    f.url
-  );
+    // Prefer progressive formats for better compatibility
+    const progressive = allFormats.filter(f =>
+      (f.ext === 'mp4' || f.ext === 'm4v') &&
+      f.vcodec && f.vcodec !== 'none' &&
+      f.acodec && f.acodec !== 'none' &&
+      f.url
+    );
 
-  if (progressive.length) {
-    chosenFormats = progressive;
-  }
+    if (progressive.length) {
+      chosenFormats = progressive;
+    }
 
-  const formats = chosenFormats.map((f, i) => {
-    const ext = extFromFormat(f);
-    const quality = f.format_note || (f.height ? `${f.height}p` : (f.abr ? `${f.abr}kbps` : 'Best'));
-    const hasVideo = !!(f.vcodec && f.vcodec !== 'none');
-    const hasAudio = !!(f.acodec && f.acodec !== 'none');
+    const formats = chosenFormats.map((f, i) => {
+      const ext = extFromFormat(f);
+      const quality = f.format_note || (f.height ? `${f.height}p` : (f.abr ? `${f.abr}kbps` : 'Best'));
+      const hasVideo = !!(f.vcodec && f.vcodec !== 'none');
+      const hasAudio = !!(f.acodec && f.acodec !== 'none');
+
+      return {
+        itag: String(f.format_id || i),
+        quality,
+        url: makeProxy(f.url, { title, ext, referer: platformConfig.referer, platform }),
+        mimeType: f.mime_type || (hasVideo ? `video/${ext}` : `audio/${ext}`),
+        hasAudio,
+        hasVideo,
+        isVideo: hasVideo,
+        audioBitrate: f.abr || (hasAudio ? 128 : 0),
+        videoCodec: f.vcodec || (hasVideo ? 'h264' : 'none'),
+        audioCodec: f.acodec || (hasAudio ? 'aac' : 'none'),
+        container: ext,
+        contentLength: Number(f.filesize || f.filesize_approx || 0)
+      };
+    });
+
+    // Fallback if no formats found
+    if (!formats.length && info?.url) {
+      formats.push({
+        itag: 'best',
+        quality: 'Original',
+        url: makeProxy(info.url, { title, ext: 'mp4', referer: platformConfig.referer, platform }),
+        mimeType: 'video/mp4',
+        hasAudio: true,
+        hasVideo: true,
+        isVideo: true,
+        audioBitrate: 128,
+        videoCodec: 'h264',
+        audioCodec: 'aac',
+        container: 'mp4',
+        contentLength: 0
+      });
+    }
 
     return {
-      itag: String(f.format_id || i),
-      quality,
-      url: makeProxy(f.url, { title, ext, referer: platformConfig.referer, platform }),
-      mimeType: f.mime_type || (hasVideo ? `video/${ext}` : `audio/${ext}`),
-      hasAudio,
-      hasVideo,
-      isVideo: hasVideo,
-      audioBitrate: f.abr || (hasAudio ? 128 : 0),
-      videoCodec: f.vcodec || (hasVideo ? 'h264' : 'none'),
-      audioCodec: f.acodec || (hasAudio ? 'aac' : 'none'),
-      container: ext,
-      contentLength: Number(f.filesize || f.filesize_approx || 0)
+      success: true,
+      platform,
+      mediaType: formats.some(f => f.hasVideo) ? 'video' : 'audio',
+      title,
+      duration: info?.duration || null,
+      thumbnails: info?.thumbnails?.length ?
+        [{ url: info.thumbnails[info.thumbnails.length - 1].url }] :
+        (info?.thumbnail ? [{ url: info.thumbnail }] : []),
+      formats,
+      directUrl: formats[0]?.url || null
     };
-  });
+  } catch (ytdlError) {
+    console.error(`yt-dlp failed for ${platform}: ${ytdlError.message}`);
 
-  // Fallback if no formats found
-  if (!formats.length && info?.url) {
+    // If yt-dlp fails completely, try a simple direct approach for supported platforms
+    if (platform === 'instagram' && (ytdlError.message.includes('timeout') || ytdlError.message.includes('no such option'))) {
+      console.log('yt-dlp failed with option error, attempting direct Instagram extraction');
+      throw new Error(`Instagram extraction failed: ${ytdlError.message}. Try setting IG_COOKIE_STRING environment variable for better success rate.`);
+    }
+
+    throw ytdlError;
+  }
+}?.url) {
     formats.push({
       itag: 'best',
       quality: 'Original',
@@ -345,38 +388,50 @@ app.get('/api/info', async (req, res) => {
   try {
     let result;
 
-    // Try controller first, fallback to yt-dlp
-    const controllerMap = {
-      youtube: 'downloadYouTubeVideo',
-      facebook: 'downloadFacebookVideo',
-      instagram: 'downloadInstagramMedia',
-      twitter: 'downloadTwitterVideo',
-      tiktok: 'downloadTikTok',
-      threads: 'downloadThreads',
-      pinterest: 'getPinterestInfo',
-      vimeo: 'downloadVimeoMedia',
-      dailymotion: 'downloadDailymotionMedia',
-      twitch: 'downloadTwitchMedia',
-      soundcloud: 'downloadSoundcloud',
-      spotify: 'downloadSpotify'
-    };
-
-    const controllerMethod = controllerMap[platform];
-    const controller = controllers[platform];
-
-    if (controller && typeof controller[controllerMethod] === 'function') {
-      console.log(`Using ${platform} controller`);
+    // For Instagram, use only the controller (metadownloader)
+    if (platform === 'instagram' && typeof controllers.instagram.downloadInstagramMedia === 'function') {
+      console.log('Using Instagram controller (metadownloader only)');
       try {
-        const controllerResult = await controller[controllerMethod](url);
+        const controllerResult = await controllers.instagram.downloadInstagramMedia(url);
         result = normalizeToUnified(platform, controllerResult);
       } catch (controllerError) {
-        console.warn(`Controller failed for ${platform}: ${controllerError.message}`);
-        console.log('Falling back to yt-dlp');
+        console.error(`Instagram controller failed: ${controllerError.message}`);
+        throw controllerError; // Don't fallback for Instagram, just fail
+      }
+    }
+    // For other platforms, try controller first, fallback to yt-dlp
+    else {
+      const controllerMap = {
+        youtube: 'downloadYouTubeVideo',
+        facebook: 'downloadFacebookVideo',
+        twitter: 'downloadTwitterVideo',
+        tiktok: 'downloadTikTok',
+        threads: 'downloadThreads',
+        pinterest: 'getPinterestInfo',
+        vimeo: 'downloadVimeoMedia',
+        dailymotion: 'downloadDailymotionMedia',
+        twitch: 'downloadTwitchMedia',
+        soundcloud: 'downloadSoundcloud',
+        spotify: 'downloadSpotify'
+      };
+
+      const controllerMethod = controllerMap[platform];
+      const controller = controllers[platform];
+
+      if (controller && typeof controller[controllerMethod] === 'function') {
+        console.log(`Using ${platform} controller`);
+        try {
+          const controllerResult = await controller[controllerMethod](url);
+          result = normalizeToUnified(platform, controllerResult);
+        } catch (controllerError) {
+          console.warn(`Controller failed for ${platform}: ${controllerError.message}`);
+          console.log('Falling back to yt-dlp');
+          result = await extractWithYtdlp(url, platform);
+        }
+      } else {
+        console.log(`No controller for ${platform}, using yt-dlp`);
         result = await extractWithYtdlp(url, platform);
       }
-    } else {
-      console.log(`No controller for ${platform}, using yt-dlp`);
-      result = await extractWithYtdlp(url, platform);
     }
 
     if (!result?.formats?.length && !result?.directUrl) {
