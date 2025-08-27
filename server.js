@@ -225,15 +225,30 @@ function normalizeToUnified(platform, rawData) {
     }];
   }
 
-  // Process formats
+  // Process formats and create proxied URLs
   const processedFormats = formats
     .filter(f => f && f.url)
     .map((f, i) => {
       const ext = extFromFormat(f);
+
+      // Create a better filename from the title
+      let cleanTitle = title.replace(/[^\w\s\-_]/g, '').trim();
+      if (cleanTitle.length > 50) {
+        cleanTitle = cleanTitle.substring(0, 50);
+      }
+      if (!cleanTitle || cleanTitle === `${platform} Media`) {
+        cleanTitle = `${platform}_media_${Date.now()}`;
+      }
+
       return {
         itag: String(f.itag || f.format_id || i),
         quality: f.quality || f.format_note || 'Original',
-        url: makeProxy(f.url, { title: title, ext: ext, referer: platformConfig.referer, platform: platform }),
+        url: makeProxy(f.url, {
+          title: cleanTitle,
+          ext: ext,
+          referer: platformConfig.referer,
+          platform: platform
+        }),
         mimeType: f.mimeType || f.mime_type || (f.hasVideo || f.isVideo ? `video/${ext}` : `audio/${ext}`),
         hasAudio: f.hasAudio !== false,
         hasVideo: f.hasVideo === true || f.isVideo === true || !!(f.vcodec && f.vcodec !== 'none'),
@@ -528,12 +543,30 @@ app.get('/api/download', (req, res) => {
 
   if (!url) return res.status(400).json({ error: 'URL is required' });
 
+  console.log(`Download endpoint called with URL: ${url}`);
+  console.log(`Filename: ${filename}, Platform: ${platform}`);
+
   const params = new URLSearchParams({ url: url });
   if (filename) params.append('filename', filename);
   if (referer) params.append('referer', referer);
   if (platform) params.append('platform', platform);
 
   res.redirect(302, `/api/direct?${params.toString()}`);
+});
+
+// Debug endpoint to see what URLs are being processed
+app.get('/api/debug', (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'URL is required' });
+
+  console.log(`Debug endpoint called with: ${url}`);
+
+  res.json({
+    receivedUrl: url,
+    platform: detectPlatform(url),
+    isMediaUrl: url.includes('rapidcdn.app') || url.includes('cdninstagram.com') || url.includes('fbcdn.net'),
+    timestamp: new Date().toISOString()
+  });
 });
 
 app.get('/api/audio', (req, res) => {

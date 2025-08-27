@@ -42,23 +42,42 @@ async function downloadInstagramMedia(url) {
         let thumbnail = '';
 
         // Handle metadownloader response format
-        if (data.media && Array.isArray(data.media)) {
-            // Format: { media: [{ url: "...", type: "video/image" }], title: "...", thumbnail: "..." }
+        if (data.status === true && data.data && Array.isArray(data.data)) {
+            // New metadownloader format: { status: true, data: [{ url: "...", thumbnail: "..." }] }
+            data.data.forEach(item => {
+                if (item.url) urls.push(item.url);
+                if (item.thumbnail && !thumbnail) thumbnail = item.thumbnail;
+            });
+
+            // Try to extract a better title from the URL
+            const shortcodeMatch = url.match(/(?:p|reel|tv)\/([A-Za-z0-9_\-]+)/);
+            if (shortcodeMatch) {
+                title = `Instagram_${shortcodeMatch[1]}`;
+            }
+
+            console.log(`Metadownloader found ${urls.length} URLs with new format`);
+        }
+        else if (data.media && Array.isArray(data.media)) {
+            // Old format: { media: [{ url: "...", type: "video/image" }], title: "...", thumbnail: "..." }
             urls = data.media.map(item => item.url).filter(Boolean);
             title = data.title || title;
             thumbnail = data.thumbnail || '';
-        } else if (data.url) {
+        }
+        else if (data.url) {
             // Format: { url: "...", title: "...", thumbnail: "..." }
             urls = [data.url];
             title = data.title || title;
             thumbnail = data.thumbnail || '';
-        } else if (Array.isArray(data)) {
+        }
+        else if (Array.isArray(data)) {
             // Format: [{ url: "..." }, ...]
             urls = data.map(item => item.url || item).filter(Boolean);
-        } else if (typeof data === 'string') {
+        }
+        else if (typeof data === 'string') {
             // Direct URL string
             urls = [data];
-        } else {
+        }
+        else {
             // Try to extract URLs from any other format
             const extractUrls = (obj) => {
                 const found = [];
@@ -79,6 +98,7 @@ async function downloadInstagramMedia(url) {
         }
 
         console.log(`Metadownloader found ${urls.length} URLs`);
+        console.log('URLs:', urls.map(u => u.substring(0, 100) + '...'));
 
         // Create format objects
         const formats = urls.map((mediaUrl, index) => {
@@ -89,7 +109,7 @@ async function downloadInstagramMedia(url) {
                 itag: `ig_${index}`,
                 quality: 'Original',
                 mimeType: isVideo ? `video/${ext}` : `image/${ext}`,
-                url: mediaUrl,
+                url: mediaUrl, // This is the actual media URL from metadownloader
                 hasAudio: isVideo,
                 hasVideo: isVideo,
                 isVideo: isVideo,
