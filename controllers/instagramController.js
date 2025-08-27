@@ -1,10 +1,32 @@
 // controllers/instagramController.js
-// Complete Instagram controller that downloads actual playable media
+// Enhanced Instagram controller using multiple reliable packages
 
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const youtubeDl = require('youtube-dl-exec');
+
+// Import specialized Instagram downloaders
+let igdl, metadownloader, instagramDl;
+
+try {
+    const btchDownloader = require('btch-downloader');
+    igdl = btchDownloader.igdl;
+} catch (e) {
+    console.warn('btch-downloader not available:', e.message);
+}
+
+try {
+    metadownloader = require('metadownloader');
+} catch (e) {
+    console.warn('metadownloader not available:', e.message);
+}
+
+try {
+    instagramDl = require('instagram-dl');
+} catch (e) {
+    console.warn('instagram-dl not available:', e.message);
+}
 
 // Instagram authentication helpers
 function getCookieString() {
@@ -37,47 +59,7 @@ function ensureCookieFile() {
     return tmp;
 }
 
-// URL and media detection utilities
-function extractUrlsFromData(data) {
-    const urls = new Set();
-
-    function traverse(obj, path = '') {
-        if (!obj) return;
-
-        if (typeof obj === 'string') {
-            if (/^https?:\/\//i.test(obj) &&
-                (obj.includes('cdninstagram.com') ||
-                 obj.includes('fbcdn.net') ||
-                 obj.includes('scontent') ||
-                 /\.(mp4|m4v|jpg|jpeg|png|webp)(\?|#|$)/i.test(obj))) {
-                urls.add(obj);
-                console.log(`Found URL at ${path}: ${obj.substring(0, 80)}...`);
-            }
-            return;
-        }
-
-        if (Array.isArray(obj)) {
-            obj.forEach((item, index) => traverse(item, `${path}[${index}]`));
-        } else if (typeof obj === 'object') {
-            // Check Instagram-specific API fields
-            const mediaFields = ['video_url', 'display_url', 'src', 'url'];
-            mediaFields.forEach(field => {
-                if (obj[field] && typeof obj[field] === 'string') {
-                    urls.add(obj[field]);
-                    console.log(`Found ${field}: ${obj[field].substring(0, 80)}...`);
-                }
-            });
-
-            Object.entries(obj).forEach(([key, value]) => {
-                traverse(value, path ? `${path}.${key}` : key);
-            });
-        }
-    }
-
-    traverse(data);
-    return Array.from(urls);
-}
-
+// Utility functions
 function isVideoUrl(url) {
     const u = url.toLowerCase();
     return u.includes('video') ||
@@ -95,51 +77,161 @@ function getMediaExtension(url) {
     return isVideoUrl(url) ? 'mp4' : 'jpg';
 }
 
-function extractMetadata(data) {
-    let title = 'Instagram Media';
-    let thumbnail = '';
+function extractUrlsFromData(data) {
+    const urls = new Set();
 
-    // Extract title from various possible locations
-    const titleSources = [
-        data?.caption?.text,
-        data?.edge_media_to_caption?.edges?.[0]?.node?.text,
-        data?.accessibility_caption,
-        data?.alt_text,
-        data?.title
-    ];
+    function traverse(obj) {
+        if (!obj) return;
 
-    for (const source of titleSources) {
-        if (source && typeof source === 'string' && source.trim()) {
-            title = source.trim().substring(0, 100);
-            break;
+        if (typeof obj === 'string') {
+            if (/^https?:\/\//i.test(obj) &&
+                (obj.includes('cdninstagram.com') ||
+                 obj.includes('fbcdn.net') ||
+                 obj.includes('scontent') ||
+                 /\.(mp4|m4v|jpg|jpeg|png|webp)(\?|#|$)/i.test(obj))) {
+                urls.add(obj);
+            }
+            return;
+        }
+
+        if (Array.isArray(obj)) {
+            obj.forEach(traverse);
+        } else if (typeof obj === 'object') {
+            // Check common Instagram fields
+            const mediaFields = ['video_url', 'display_url', 'src', 'url'];
+            mediaFields.forEach(field => {
+                if (obj[field] && typeof obj[field] === 'string') {
+                    urls.add(obj[field]);
+                }
+            });
+
+            Object.values(obj).forEach(traverse);
         }
     }
 
-    // Extract thumbnail from various possible locations
-    const thumbnailSources = [
-        data?.thumbnail_url,
-        data?.display_url,
-        data?.image_versions2?.candidates?.[0]?.url,
-        data?.thumbnail,
-        data?.image
-    ];
-
-    for (const source of thumbnailSources) {
-        if (source && typeof source === 'string' && source.startsWith('http')) {
-            thumbnail = source;
-            break;
-        }
-    }
-
-    return { title, thumbnail };
+    traverse(data);
+    return Array.from(urls);
 }
 
-// Method 1: Instagram API approach
-async function tryInstagramAPI(url) {
-    try {
-        console.log('Attempting Instagram API method...');
+// Method 1: btch-downloader (most reliable for Instagram)
+async function tryBtchDownloader(url) {
+    if (!igdl) {
+        console.log('btch-downloader not available, skipping');
+        return null;
+    }
 
-        const shortcodeMatch = url.match(/(?:instagram\.com\/(?:p|reel|tv)\/|instagram\.com\/stories\/[^\/]+\/)([A-Za-z0-9_\-]+)/);
+    try {
+        console.log('Attempting btch-downloader method...');
+        const data = await igdl(url);
+
+        if (data && Array.isArray(data) && data.length > 0) {
+            const urls = data.map(item => item.url).filter(Boolean);
+
+            if (urls.length > 0) {
+                console.log(`btch-downloader found ${urls.length} URLs`);
+                return {
+                    success: true,
+                    urls,
+                    title: data[0]?.wm || 'Instagram Media',
+                    thumbnail: data[0]?.thumbnail || '',
+                    method: 'btch-downloader'
+                };
+            }
+        }
+
+        return null;
+    } catch (error) {
+        console.log(`btch-downloader failed: ${error.message}`);
+        return null;
+    }
+}
+
+// Method 2: metadownloader (good fallback)
+async function tryMetadownloader(url) {
+    if (!metadownloader) {
+        console.log('metadownloader not available, skipping');
+        return null;
+    }
+
+    try {
+        console.log('Attempting metadownloader method...');
+        const data = await metadownloader(url);
+
+        if (data) {
+            let urls = [];
+            let title = 'Instagram Media';
+            let thumbnail = '';
+
+            // Handle different response formats
+            if (data.media && Array.isArray(data.media)) {
+                urls = data.media.map(item => item.url).filter(Boolean);
+                title = data.title || title;
+                thumbnail = data.thumbnail || '';
+            } else {
+                urls = extractUrlsFromData(data);
+                if (data.title) title = data.title;
+                if (data.thumbnail) thumbnail = data.thumbnail;
+            }
+
+            if (urls.length > 0) {
+                console.log(`metadownloader found ${urls.length} URLs`);
+                return {
+                    success: true,
+                    urls,
+                    title,
+                    thumbnail,
+                    method: 'metadownloader'
+                };
+            }
+        }
+
+        return null;
+    } catch (error) {
+        console.log(`metadownloader failed: ${error.message}`);
+        return null;
+    }
+}
+
+// Method 3: instagram-dl package
+async function tryInstagramDl(url) {
+    if (!instagramDl) {
+        console.log('instagram-dl not available, skipping');
+        return null;
+    }
+
+    try {
+        console.log('Attempting instagram-dl method...');
+        const data = await instagramDl(url);
+
+        if (data && data.url) {
+            console.log('instagram-dl found media URL');
+            return {
+                success: true,
+                urls: [data.url],
+                title: data.title || 'Instagram Media',
+                thumbnail: data.thumbnail || '',
+                method: 'instagram-dl'
+            };
+        }
+
+        return null;
+    } catch (error) {
+        console.log(`instagram-dl failed: ${error.message}`);
+        return null;
+    }
+}
+
+// Method 4: Direct API scraping (enhanced)
+async function tryDirectAPI(url) {
+    try {
+        console.log('Attempting direct API method...');
+
+        // Handle stories differently
+        if (url.includes('/stories/')) {
+            return await tryStoryExtraction(url);
+        }
+
+        const shortcodeMatch = url.match(/(?:instagram\.com\/(?:p|reel|tv)\/)([A-Za-z0-9_\-]+)/);
         if (!shortcodeMatch) {
             throw new Error('Could not extract shortcode from URL');
         }
@@ -147,84 +239,76 @@ async function tryInstagramAPI(url) {
         const shortcode = shortcodeMatch[1];
         console.log(`Extracted shortcode: ${shortcode}`);
 
-        const baseHeaders = {
+        const headers = {
             'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
-            'Accept': 'application/json, text/plain, */*',
+            'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'X-IG-App-ID': '936619743392459',
-            'X-ASBD-ID': '129477',
-            'X-IG-WWW-Claim': '0',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'same-origin'
+            'X-IG-App-ID': '936619743392459'
         };
 
         const cookieStr = getCookieString();
         if (cookieStr) {
-            baseHeaders['Cookie'] = cookieStr;
+            headers['Cookie'] = cookieStr;
         }
 
-        // Try multiple API endpoints
+        // Try multiple endpoints
         const endpoints = [
             `https://www.instagram.com/api/v1/media/${shortcode}/info/`,
             `https://i.instagram.com/api/v1/media/${shortcode}/info/`,
-            `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`
+            `https://www.instagram.com/p/${shortcode}/embed/captioned/`
         ];
 
         for (const endpoint of endpoints) {
             try {
-                console.log(`Trying API endpoint: ${endpoint}`);
+                console.log(`Trying endpoint: ${endpoint}`);
                 const response = await axios.get(endpoint, {
-                    headers: baseHeaders,
-                    timeout: 15000,
-                    maxRedirects: 3
+                    headers,
+                    timeout: 15000
                 });
 
                 if (response.data) {
                     const urls = extractUrlsFromData(response.data);
                     if (urls.length > 0) {
-                        console.log(`API method found ${urls.length} URLs`);
-                        const metadata = extractMetadata(response.data);
+                        console.log(`Direct API found ${urls.length} URLs`);
                         return {
                             success: true,
                             urls,
-                            title: metadata.title,
-                            thumbnail: metadata.thumbnail,
-                            method: 'instagram-api'
+                            title: response.data.title || 'Instagram Media',
+                            thumbnail: '',
+                            method: 'direct-api'
                         };
                     }
                 }
             } catch (endpointError) {
-                console.log(`API endpoint failed: ${endpoint} - ${endpointError.message}`);
+                console.log(`Endpoint failed: ${endpoint} - ${endpointError.message}`);
                 continue;
             }
         }
 
         return null;
     } catch (error) {
-        console.log(`Instagram API method failed: ${error.message}`);
+        console.log(`Direct API method failed: ${error.message}`);
         return null;
     }
 }
 
-// Method 2: Page scraping approach
-async function tryPageScraping(url) {
+// Enhanced story extraction
+async function tryStoryExtraction(url) {
     try {
-        console.log('Attempting page scraping method...');
+        console.log('Attempting enhanced story extraction...');
 
         const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache'
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9'
         };
 
         const cookieStr = getCookieString();
         if (cookieStr) {
             headers['Cookie'] = cookieStr;
+        } else {
+            console.log('Warning: No Instagram cookies - stories may require authentication');
+            throw new Error('Instagram stories require authentication. Please set IG_COOKIE_STRING environment variable.');
         }
 
         const response = await axios.get(url, {
@@ -234,46 +318,45 @@ async function tryPageScraping(url) {
 
         const html = response.data;
 
-        // Extract JSON data from page
-        const jsonPatterns = [
-            /window\._sharedData\s*=\s*({.+?});/,
-            /{"config":.+?"graphql":.+?}(?=;<\/script>)/,
-            /"gql_data":\s*({.+?})/
+        // Enhanced story media extraction patterns
+        const storyPatterns = [
+            /"video_url":"([^"]+)"/g,
+            /"display_url":"([^"]+)"/g,
+            /https:\/\/scontent[^"'\s]*\.(?:mp4|jpg|png|webp)(?:\?[^"'\s]*)?/g,
+            /https:\/\/[^"'\s]*fbcdn\.net[^"'\s]*\.(?:mp4|jpg|png|webp)(?:\?[^"'\s]*)?/g
         ];
 
-        for (const pattern of jsonPatterns) {
-            const match = html.match(pattern);
-            if (match && match[1]) {
-                try {
-                    const jsonData = JSON.parse(match[1]);
-                    const urls = extractUrlsFromData(jsonData);
+        const urls = new Set();
 
-                    if (urls.length > 0) {
-                        console.log(`Page scraping found ${urls.length} URLs`);
-                        const metadata = extractMetadata(jsonData);
-                        return {
-                            success: true,
-                            urls,
-                            title: metadata.title,
-                            thumbnail: metadata.thumbnail,
-                            method: 'page-scraping'
-                        };
-                    }
-                } catch (parseError) {
-                    console.log(`Failed to parse JSON from page: ${parseError.message}`);
-                    continue;
+        for (const pattern of storyPatterns) {
+            let match;
+            while ((match = pattern.exec(html)) !== null) {
+                const mediaUrl = (match[1] || match[0]).replace(/\\u002F/g, '/').replace(/\\/g, '');
+                if (mediaUrl && mediaUrl.startsWith('http')) {
+                    urls.add(mediaUrl);
+                    console.log(`Found story media: ${mediaUrl.substring(0, 80)}...`);
                 }
             }
         }
 
+        if (urls.size > 0) {
+            return {
+                success: true,
+                urls: Array.from(urls),
+                title: 'Instagram Story',
+                thumbnail: '',
+                method: 'story-extraction'
+            };
+        }
+
         return null;
     } catch (error) {
-        console.log(`Page scraping method failed: ${error.message}`);
-        return null;
+        console.log(`Story extraction failed: ${error.message}`);
+        throw error;
     }
 }
 
-// Method 3: yt-dlp approach
+// Method 5: yt-dlp fallback (fixed options)
 async function tryYtDlp(url) {
     const cookieFile = ensureCookieFile();
 
@@ -285,8 +368,7 @@ async function tryYtDlp(url) {
             noWarnings: true,
             noCheckCertificates: true,
             referer: 'https://www.instagram.com/',
-            userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
-            timeout: 30
+            userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1'
         };
 
         if (cookieFile) {
@@ -295,7 +377,6 @@ async function tryYtDlp(url) {
 
         const info = await youtubeDl(url, options);
 
-        // Extract URLs from yt-dlp response
         const urls = new Set();
         if (info.url) urls.add(info.url);
         if (info.formats && Array.isArray(info.formats)) {
@@ -309,7 +390,7 @@ async function tryYtDlp(url) {
         }
 
         const urlArray = Array.from(urls);
-        console.log(`yt-dlp method found ${urlArray.length} URLs`);
+        console.log(`yt-dlp found ${urlArray.length} URLs`);
 
         return {
             success: true,
@@ -322,13 +403,13 @@ async function tryYtDlp(url) {
 
     } catch (error) {
         const errorMsg = error.message || String(error);
-        console.log(`yt-dlp method failed: ${errorMsg}`);
+        console.log(`yt-dlp failed: ${errorMsg}`);
 
         if (errorMsg.includes('Sign in to confirm') ||
             errorMsg.includes('private') ||
             errorMsg.includes('login_required')) {
             throw new Error(
-                'This Instagram content requires authentication. Please set IG_COOKIE_STRING environment variable with valid Instagram cookies from your browser.'
+                'This Instagram content requires authentication. Please set IG_COOKIE_STRING environment variable.'
             );
         }
 
@@ -340,7 +421,7 @@ async function tryYtDlp(url) {
     }
 }
 
-// Main extraction function
+// Main extraction function with multiple methods
 async function downloadInstagramMedia(url) {
     console.log(`Starting Instagram extraction for: ${url}`);
 
@@ -353,8 +434,10 @@ async function downloadInstagramMedia(url) {
 
     // Try methods in order of reliability
     const methods = [
-        { name: 'Instagram API', fn: tryInstagramAPI },
-        { name: 'Page Scraping', fn: tryPageScraping },
+        { name: 'btch-downloader', fn: tryBtchDownloader },
+        { name: 'metadownloader', fn: tryMetadownloader },
+        { name: 'instagram-dl', fn: tryInstagramDl },
+        { name: 'direct-api', fn: tryDirectAPI },
         { name: 'yt-dlp', fn: tryYtDlp }
     ];
 
@@ -374,7 +457,7 @@ async function downloadInstagramMedia(url) {
             console.log(`× ${method.name} failed: ${error.message}`);
             lastError = error;
 
-            // If this is an auth error from yt-dlp, don't try other methods
+            // For auth errors, stop trying other methods
             if (error.message.includes('authentication') ||
                 error.message.includes('IG_COOKIE_STRING')) {
                 throw error;
@@ -386,7 +469,7 @@ async function downloadInstagramMedia(url) {
         throw lastError || new Error('All Instagram extraction methods failed - no playable media found');
     }
 
-    // Process URLs and create format objects
+    // Process URLs into format objects
     const formats = result.urls.map((mediaUrl, index) => {
         const isVideo = isVideoUrl(mediaUrl);
         const ext = getMediaExtension(mediaUrl);
@@ -395,7 +478,7 @@ async function downloadInstagramMedia(url) {
             itag: `ig_${index}`,
             quality: 'Original',
             mimeType: isVideo ? `video/${ext}` : `image/${ext}`,
-            url: mediaUrl, // Raw URL - will be proxied by server
+            url: mediaUrl,
             hasAudio: isVideo,
             hasVideo: isVideo,
             isVideo: isVideo,
