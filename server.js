@@ -1,4 +1,4 @@
-// server.js — Complete UniSaver Backend with Enhanced Multi-Platform Support
+// server.js — UniSaver Backend Compatible with Older Node.js
 require('dotenv').config();
 process.env.YTDL_NO_UPDATE = '1';
 
@@ -8,7 +8,6 @@ const morgan = require('morgan');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
-const ytdlp = require('youtube-dl-exec');
 const path = require('path');
 const fs = require('fs');
 
@@ -155,7 +154,8 @@ function getPlatformConfig(platform, url) {
 }
 
 // Utility functions
-function titleFromInfo(info, fallback = 'Media') {
+function titleFromInfo(info, fallback) {
+  fallback = fallback || 'Media';
   return (info && (info.title || info.fulltitle)) || fallback;
 }
 
@@ -172,8 +172,13 @@ function extFromFormat(f) {
   return 'mp4';
 }
 
-function makeProxy(mediaUrl, options = {}) {
-  const { title = 'Media', ext = 'mp4', referer = null, platform = null } = options;
+function makeProxy(mediaUrl, options) {
+  options = options || {};
+  const title = options.title || 'Media';
+  const ext = options.ext || 'mp4';
+  const referer = options.referer || null;
+  const platform = options.platform || null;
+
   const safeTitle = String(title).replace(/[^\w\-\s]+/g, '_').trim().slice(0, 50);
 
   const params = new URLSearchParams({
@@ -189,20 +194,28 @@ function makeProxy(mediaUrl, options = {}) {
 
 // Format normalization
 function normalizeToUnified(platform, rawData) {
-  const data = rawData?.data || rawData;
+  const data = rawData.data || rawData;
 
-  const title = data?.title || `${platform} Media`;
-  const thumbnail = data?.thumbnail || data?.thumbnails?.[0]?.url || '';
+  const title = data.title || `${platform} Media`;
+  let thumbnail = '';
+
+  // Handle different thumbnail formats
+  if (data.thumbnail) {
+    thumbnail = data.thumbnail;
+  } else if (data.thumbnails && Array.isArray(data.thumbnails) && data.thumbnails.length > 0) {
+    thumbnail = data.thumbnails[0].url || '';
+  }
+
   const platformConfig = getPlatformConfig(platform);
-  const mediaType = data?.mediaType || (data?.audio ? 'audio' : 'video');
+  const mediaType = data.mediaType || (data.audio ? 'audio' : 'video');
 
-  let formats = data?.formats || [];
+  let formats = data.formats || [];
 
   // Handle single URL case
-  if (!formats.length && (data?.url || data?.directUrl)) {
+  if (!formats.length && (data.url || data.directUrl)) {
     formats = [{
       itag: 'best',
-      quality: data?.quality || 'Original',
+      quality: data.quality || 'Original',
       url: data.url || data.directUrl,
       mimeType: mediaType === 'audio' ? 'audio/mp3' : 'video/mp4',
       hasAudio: mediaType !== 'video-only',
@@ -214,13 +227,13 @@ function normalizeToUnified(platform, rawData) {
 
   // Process formats
   const processedFormats = formats
-    .filter(f => f?.url)
+    .filter(f => f && f.url)
     .map((f, i) => {
       const ext = extFromFormat(f);
       return {
         itag: String(f.itag || f.format_id || i),
         quality: f.quality || f.format_note || 'Original',
-        url: makeProxy(f.url, { title, ext, referer: platformConfig.referer, platform }),
+        url: makeProxy(f.url, { title: title, ext: ext, referer: platformConfig.referer, platform: platform }),
         mimeType: f.mimeType || f.mime_type || (f.hasVideo || f.isVideo ? `video/${ext}` : `audio/${ext}`),
         hasAudio: f.hasAudio !== false,
         hasVideo: f.hasVideo === true || f.isVideo === true || !!(f.vcodec && f.vcodec !== 'none'),
@@ -235,151 +248,19 @@ function normalizeToUnified(platform, rawData) {
 
   return {
     success: true,
-    platform,
-    mediaType,
-    title,
-    duration: data?.duration || null,
+    platform: platform,
+    mediaType: mediaType,
+    title: title,
+    duration: data.duration || null,
     thumbnails: thumbnail ? [{ url: thumbnail }] : [],
     formats: processedFormats,
-    directUrl: processedFormats[0]?.url || null
-  };
-}
-
-// Generic yt-dlp extractor with compatible options
-async function extractWithYtdlp(url, platform) {
-  const platformConfig = getPlatformConfig(platform, url);
-
-  // Use only compatible options (remove --timeout and other problematic flags)
-  const options = {
-    dumpSingleJson: true,
-    noWarnings: true,
-    noCheckCertificates: true,
-    userAgent: platformConfig.userAgent
-    // Removed timeout option as it's not supported in some versions
-  };
-
-  if (platformConfig.referer) {
-    options.referer = platformConfig.referer;
-  }
-
-  try {
-    console.log(`Executing yt-dlp for ${platform} with compatible options`);
-    const info = await youtubeDl(url, options);
-    const title = titleFromInfo(info, `${platform} Media`);
-
-    // Process formats
-    const allFormats = Array.isArray(info?.formats) ? info.formats : [];
-    let chosenFormats = allFormats.filter(f => f.url);
-
-    // Prefer progressive formats for better compatibility
-    const progressive = allFormats.filter(f =>
-      (f.ext === 'mp4' || f.ext === 'm4v') &&
-      f.vcodec && f.vcodec !== 'none' &&
-      f.acodec && f.acodec !== 'none' &&
-      f.url
-    );
-
-    if (progressive.length) {
-      chosenFormats = progressive;
-    }
-
-    const formats = chosenFormats.map((f, i) => {
-      const ext = extFromFormat(f);
-      const quality = f.format_note || (f.height ? `${f.height}p` : (f.abr ? `${f.abr}kbps` : 'Best'));
-      const hasVideo = !!(f.vcodec && f.vcodec !== 'none');
-      const hasAudio = !!(f.acodec && f.acodec !== 'none');
-
-      return {
-        itag: String(f.format_id || i),
-        quality,
-        url: makeProxy(f.url, { title, ext, referer: platformConfig.referer, platform }),
-        mimeType: f.mime_type || (hasVideo ? `video/${ext}` : `audio/${ext}`),
-        hasAudio,
-        hasVideo,
-        isVideo: hasVideo,
-        audioBitrate: f.abr || (hasAudio ? 128 : 0),
-        videoCodec: f.vcodec || (hasVideo ? 'h264' : 'none'),
-        audioCodec: f.acodec || (hasAudio ? 'aac' : 'none'),
-        container: ext,
-        contentLength: Number(f.filesize || f.filesize_approx || 0)
-      };
-    });
-
-    // Fallback if no formats found
-    if (!formats.length && info?.url) {
-      formats.push({
-        itag: 'best',
-        quality: 'Original',
-        url: makeProxy(info.url, { title, ext: 'mp4', referer: platformConfig.referer, platform }),
-        mimeType: 'video/mp4',
-        hasAudio: true,
-        hasVideo: true,
-        isVideo: true,
-        audioBitrate: 128,
-        videoCodec: 'h264',
-        audioCodec: 'aac',
-        container: 'mp4',
-        contentLength: 0
-      });
-    }
-
-    return {
-      success: true,
-      platform,
-      mediaType: formats.some(f => f.hasVideo) ? 'video' : 'audio',
-      title,
-      duration: info?.duration || null,
-      thumbnails: info?.thumbnails?.length ?
-        [{ url: info.thumbnails[info.thumbnails.length - 1].url }] :
-        (info?.thumbnail ? [{ url: info.thumbnail }] : []),
-      formats,
-      directUrl: formats[0]?.url || null
-    };
-  } catch (ytdlError) {
-    console.error(`yt-dlp failed for ${platform}: ${ytdlError.message}`);
-
-    // If yt-dlp fails completely, try a simple direct approach for supported platforms
-    if (platform === 'instagram' && (ytdlError.message.includes('timeout') || ytdlError.message.includes('no such option'))) {
-      console.log('yt-dlp failed with option error, attempting direct Instagram extraction');
-      throw new Error(`Instagram extraction failed: ${ytdlError.message}. Try setting IG_COOKIE_STRING environment variable for better success rate.`);
-    }
-
-    throw ytdlError;
-  }
-}?.url) {
-    formats.push({
-      itag: 'best',
-      quality: 'Original',
-      url: makeProxy(info.url, { title, ext: 'mp4', referer: platformConfig.referer, platform }),
-      mimeType: 'video/mp4',
-      hasAudio: true,
-      hasVideo: true,
-      isVideo: true,
-      audioBitrate: 128,
-      videoCodec: 'h264',
-      audioCodec: 'aac',
-      container: 'mp4',
-      contentLength: 0
-    });
-  }
-
-  return {
-    success: true,
-    platform,
-    mediaType: formats.some(f => f.hasVideo) ? 'video' : 'audio',
-    title,
-    duration: info?.duration || null,
-    thumbnails: info?.thumbnails?.length ?
-      [{ url: info.thumbnails[info.thumbnails.length - 1].url }] :
-      (info?.thumbnail ? [{ url: info.thumbnail }] : []),
-    formats,
-    directUrl: formats[0]?.url || null
+    directUrl: processedFormats.length > 0 ? processedFormats[0].url : null
   };
 }
 
 // Main info endpoint
 app.get('/api/info', async (req, res) => {
-  const { url } = req.query;
+  const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'URL is required' });
 
   const platform = detectPlatform(url);
@@ -396,10 +277,10 @@ app.get('/api/info', async (req, res) => {
         result = normalizeToUnified(platform, controllerResult);
       } catch (controllerError) {
         console.error(`Instagram controller failed: ${controllerError.message}`);
-        throw controllerError; // Don't fallback for Instagram, just fail
+        throw controllerError;
       }
     }
-    // For other platforms, try controller first, fallback to yt-dlp
+    // For other platforms, try controller first
     else {
       const controllerMap = {
         youtube: 'downloadYouTubeVideo',
@@ -425,20 +306,19 @@ app.get('/api/info', async (req, res) => {
           result = normalizeToUnified(platform, controllerResult);
         } catch (controllerError) {
           console.warn(`Controller failed for ${platform}: ${controllerError.message}`);
-          console.log('Falling back to yt-dlp');
-          result = await extractWithYtdlp(url, platform);
+          throw controllerError;
         }
       } else {
-        console.log(`No controller for ${platform}, using yt-dlp`);
-        result = await extractWithYtdlp(url, platform);
+        console.log(`No controller available for ${platform}`);
+        throw new Error(`Platform ${platform} is not supported yet`);
       }
     }
 
-    if (!result?.formats?.length && !result?.directUrl) {
+    if (!result || !result.formats || result.formats.length === 0) {
       return res.status(422).json({
         error: 'No playable media found',
         errorDetail: 'Could not extract any downloadable media from this URL',
-        platform
+        platform: platform
       });
     }
 
@@ -450,14 +330,17 @@ app.get('/api/info', async (req, res) => {
     res.status(500).json({
       error: 'Processing failed',
       errorDetail: String(error.message || error),
-      platform
+      platform: platform
     });
   }
 });
 
 // Enhanced direct proxy endpoint
 app.get('/api/direct', async (req, res) => {
-  const { url, filename, referer, platform } = req.query;
+  const url = req.query.url;
+  const filename = req.query.filename;
+  const referer = req.query.referer;
+  const platform = req.query.platform;
 
   if (!url) {
     return res.status(400).json({ error: 'URL is required' });
@@ -484,7 +367,7 @@ app.get('/api/direct', async (req, res) => {
       headers['Referer'] = platformConfig.referer;
       try {
         headers['Origin'] = new URL(platformConfig.referer).origin;
-      } catch {}
+      } catch (e) {}
     }
 
     if (platformConfig.headers) {
@@ -508,7 +391,7 @@ app.get('/api/direct', async (req, res) => {
     const response = await axios({
       method: 'GET',
       url: url,
-      headers,
+      headers: headers,
       responseType: 'stream',
       maxRedirects: 5,
       timeout: 45000,
@@ -582,21 +465,21 @@ app.get('/api/direct', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Direct proxy error:', error?.message || error);
+    console.error('Direct proxy error:', error.message || error);
 
     let errorMessage = 'Download failed';
-    let errorDetail = String(error?.message || error);
+    let errorDetail = String(error.message || error);
 
-    if (error?.code === 'ECONNREFUSED') {
+    if (error.code === 'ECONNREFUSED') {
       errorMessage = 'Connection refused';
       errorDetail = 'Could not connect to media server';
-    } else if (error?.code === 'ETIMEDOUT') {
+    } else if (error.code === 'ETIMEDOUT') {
       errorMessage = 'Request timeout';
       errorDetail = 'Media server response timeout';
-    } else if (error?.response?.status === 403) {
+    } else if (error.response && error.response.status === 403) {
       errorMessage = 'Access forbidden';
       errorDetail = 'Media server denied access';
-    } else if (error?.response?.status === 404) {
+    } else if (error.response && error.response.status === 404) {
       errorMessage = 'Media not found';
       errorDetail = 'Requested media not found or expired';
     }
@@ -618,11 +501,11 @@ const platformEndpoints = [
 
 platformEndpoints.forEach(platform => {
   app.get(`/api/${platform}`, async (req, res) => {
-    const { url } = req.query;
+    const url = req.query.url;
     if (!url) return res.status(400).json({ error: 'URL is required' });
 
     try {
-      // Forward to main info endpoint with platform detection
+      // Forward to main info endpoint
       const response = await axios.get(`http://localhost:${PORT}/api/info?url=${encodeURIComponent(url)}`);
       res.json(response.data);
     } catch (error) {
@@ -630,7 +513,7 @@ platformEndpoints.forEach(platform => {
       res.status(500).json({
         error: `${platform} processing failed`,
         errorDetail: String(error.message || error),
-        platform
+        platform: platform
       });
     }
   });
@@ -638,10 +521,14 @@ platformEndpoints.forEach(platform => {
 
 // Utility endpoints
 app.get('/api/download', (req, res) => {
-  const { url, filename, referer, platform } = req.query;
+  const url = req.query.url;
+  const filename = req.query.filename;
+  const referer = req.query.referer;
+  const platform = req.query.platform;
+
   if (!url) return res.status(400).json({ error: 'URL is required' });
 
-  const params = new URLSearchParams({ url });
+  const params = new URLSearchParams({ url: url });
   if (filename) params.append('filename', filename);
   if (referer) params.append('referer', referer);
   if (platform) params.append('platform', platform);
@@ -650,11 +537,14 @@ app.get('/api/download', (req, res) => {
 });
 
 app.get('/api/audio', (req, res) => {
-  const { url, referer, platform } = req.query;
+  const url = req.query.url;
+  const referer = req.query.referer;
+  const platform = req.query.platform;
+
   if (!url) return res.status(400).json({ error: 'URL is required' });
 
   const params = new URLSearchParams({
-    url,
+    url: url,
     filename: 'audio.mp3'
   });
   if (referer) params.append('referer', referer);
@@ -668,7 +558,7 @@ app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({
     error: 'Internal server error',
-    errorDetail: String(err?.message || err)
+    errorDetail: String(err.message || err)
   });
 });
 
@@ -676,6 +566,5 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`🚀 UniSaver Backend running on http://localhost:${PORT}`);
   console.log(`📱 Multi-platform media downloader ready`);
-  console.log(`🔧 Supported platforms: ${platformEndpoints.join(', ')}`);
   console.log(`⚡ Enhanced streaming proxy enabled`);
 });
