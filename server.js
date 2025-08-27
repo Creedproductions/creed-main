@@ -820,6 +820,7 @@ app.use((err, req, res, next) => {
   });
 });
 
+// Start server
 app.listen(PORT, () => {
   console.log(`🚀 UniSaver Backend running on http://localhost:${PORT}`);
   console.log(`📱 Multi-platform media downloader ready`);
